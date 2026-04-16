@@ -10,10 +10,9 @@ from omegaconf import OmegaConf, listconfig
 from pytorch_lightning import LightningModule
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.strategies import DDPStrategy
-
 from boltzgen.task.task import Task
 from boltzgen.task.train.data import DataConfig, TrainingDataModule
+from boltzgen.utils.pl_musa import make_ddp_strategy, patch_trainer_kwargs_for_musa
 
 
 class Training(Task):
@@ -204,10 +203,12 @@ class Training(Task):
         if (isinstance(devices, int) and devices > 1) or (
             isinstance(devices, (list, listconfig.ListConfig)) and len(devices) > 1
         ):
-            strategy = DDPStrategy(
+            strategy = make_ddp_strategy(
                 find_unused_parameters=self.find_unused_parameters,
                 timeout=datetime.timedelta(seconds=self.ddp_timeout_seconds),
             )
+
+        patch_trainer_kwargs_for_musa(self.trainer)
 
         trainer = pl.Trainer(
             default_root_dir=str(dirpath),

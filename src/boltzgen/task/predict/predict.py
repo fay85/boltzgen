@@ -14,8 +14,6 @@ import torch
 from omegaconf import OmegaConf, listconfig
 from pytorch_lightning import LightningModule, Trainer
 
-from pytorch_lightning.strategies import DDPStrategy
-
 from boltzgen.task.predict.data_from_generated import FromGeneratedDataModule
 from boltzgen.task.predict.writer import (
     DesignWriter,
@@ -23,6 +21,7 @@ from boltzgen.task.predict.writer import (
 )
 from boltzgen.task.task import Task
 from boltzgen.utils.pipeline_progress_bar import PipelineProgressBar
+from boltzgen.utils.pl_musa import make_ddp_strategy, patch_trainer_kwargs_for_musa
 from boltzgen.model.models.boltz import Boltz
 
 
@@ -168,12 +167,14 @@ class Predict(Task):
             else devices
         )
         if num_devices > 1:
-            strategy = DDPStrategy()
+            strategy = make_ddp_strategy()
             if num_devices > len(self.data.predict_set):
                 devices = max(1, len(self.data.predict_set))
                 msg = f"Fewer designs than devices. Setting devices to {devices}."
                 print(msg)
                 self.trainer["devices"] = devices
+
+        patch_trainer_kwargs_for_musa(self.trainer)
 
         self.lightning_trainer = Trainer(
             default_root_dir=self.output,
