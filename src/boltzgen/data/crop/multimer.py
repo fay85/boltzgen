@@ -363,6 +363,7 @@ class MultimerCropper(Cropper):
                     # include all tokens from modified residues or from ligands.
                     min_idx = max_idx = token["res_idx"]
                     counter = 0
+                    prev_size = -1
                     while new_tokens.size < neighborhood_size:
                         counter += 1
                         min_idx = min_idx - 1
@@ -370,8 +371,11 @@ class MultimerCropper(Cropper):
                         new_tokens = max_token_set
                         new_tokens = new_tokens[new_tokens["res_idx"] >= min_idx]
                         new_tokens = new_tokens[new_tokens["res_idx"] <= max_idx]
+                        if new_tokens.size == prev_size:
+                            break
+                        prev_size = int(new_tokens.size)
                         if counter > 1000:
-                            raise Exception("Infinite loop in cropper while loop")
+                            break
 
             # Compute new tokens and new atoms
             new_token_mask = np.isin(tokens["token_idx"], new_tokens["token_idx"])

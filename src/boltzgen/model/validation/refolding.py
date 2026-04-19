@@ -299,7 +299,13 @@ class RefoldingValidator(design.DesignValidator):
         self.folding_model = None
         del self.affinity_model
         self.affinity_model = None
-        torch._C._musa_clearCublasWorkspaces()
+        # Naive `cuda` -> `musa` rename produced `torch._C._musa_clearCublasWorkspaces`,
+        # but torch_musa does not expose that binding (only the C++ symbol
+        # `at::musa::clearCublasWorkspaces()` exists internally). The
+        # `torch.musa.empty_cache()` call below releases workspace memory either way.
+        _clear_cublas = getattr(torch._C, "_musa_clearCublasWorkspaces", None)
+        if _clear_cublas is not None:
+            _clear_cublas()
         torch._dynamo.reset()
         gc.collect()
         torch.musa.empty_cache()

@@ -80,9 +80,26 @@ def weighted_rigid_align(
     original_dtype = cov_matrix.dtype
     cov_matrix_32 = cov_matrix.to(dtype=torch.float32)
 
-    U, S, V = torch.linalg.svd(
-        cov_matrix_32, driver="gesvd" if cov_matrix_32.is_musa else None
-    )
+    # cuSOLVER gesvd driver is CUDA-only; MUSA/CPU must use default SVD (no driver= kwarg).
+    _svd_kw = {}
+    if cov_matrix_32.is_cuda:
+        _svd_kw["driver"] = "gesvd"
+
+    # SVD aborts with "input matrix contained non-finite values" if any element
+    # of cov_matrix_32 is NaN/Inf. On MUSA we have seen this fire after long
+    # bf16 sampler chains in the refolding validator. Fall back to an identity
+    # rotation so callers get a finite result instead of an exception (the
+    # surrounding try/except would otherwise turn the metric into NaN).
+    if not torch.isfinite(cov_matrix_32).all():
+        rot_eye = torch.eye(dim, dtype=torch.float32, device=cov_matrix.device)[None].repeat(batch_size, 1, 1)
+        aligned_coords = (
+            einsum(true_coords_centered, rot_eye.to(dtype=original_dtype), "b n i, b j i -> b n j")
+            + pred_centroid
+        )
+        aligned_coords.detach_()
+        return aligned_coords
+
+    U, S, V = torch.linalg.svd(cov_matrix_32, **_svd_kw)
     V = V.mH
 
     # Catch ambiguous rotation by checking the magnitude of singular values

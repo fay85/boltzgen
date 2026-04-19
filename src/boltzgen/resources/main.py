@@ -1,11 +1,37 @@
-import torch_musa
+import os
 import sys
 from typing import List
-import hydra
-import omegaconf
 
+import torch_musa
 
-from boltzgen.task.task import Task
+# CRITICAL: bind this DDP rank to its own MUSA device BEFORE anything else
+# touches MUSA. Lightning's DDPLauncher sets LOCAL_RANK on every subprocess
+# before exec'ing this script (the rank-0 main process gets it set right after
+# the launcher fan-out as well). If we don't do this, every later MUSA probe
+# (e.g. torch.musa.is_available, the PL accelerator's device-count check, the
+# autocast device probe in MUSAMixedPrecision, etc.) creates the default
+# context on device 0 in *every* rank. With 8 ranks that costs ~64 GiB of HBM
+# squatting on device 0, leaving rank 0 with only ~15 GiB for real work and
+# making it OOM almost immediately while devices 1-7 sit idle.
+#
+# A later torch.musa.set_device(N) call (which is what
+# MUSACUDAAccelerator.setup_device does) does NOT free the dev-0 context once
+# it exists, so this *must* happen before any other MUSA call in the process.
+_local_rank_env = os.environ.get("LOCAL_RANK")
+if _local_rank_env is not None:
+    try:
+        _local_rank = int(_local_rank_env)
+        if torch_musa.device_count() > _local_rank:
+            torch_musa.set_device(_local_rank)
+    except Exception:
+        # Don't let device-binding hiccups prevent the process from starting;
+        # the worst case is we fall back to the original (broken) behaviour.
+        pass
+
+import hydra  # noqa: E402
+import omegaconf  # noqa: E402
+
+from boltzgen.task.task import Task  # noqa: E402
 
 
 def main(config: str, args: List) -> None:

@@ -12,6 +12,7 @@ from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from boltzgen.task.task import Task
 from boltzgen.task.train.data import DataConfig, TrainingDataModule
+from boltzgen.utils.align_logger import AlignmentLogger
 from boltzgen.utils.pl_musa import make_ddp_strategy, patch_trainer_kwargs_for_musa
 
 
@@ -164,6 +165,15 @@ class Training(Task):
             )
             callbacks.append(mc)
 
+        # Always-on alignment logger: emits one '[ALIGN] step=... loss=...'
+        # line per training step on rank 0 in a format that's byte-identical
+        # between the CUDA and MUSA forks. Used to compare numerical training
+        # behaviour between the two stacks; see boltzgen/utils/align_logger.py.
+        # Set BOLTZGEN_ALIGN_LOG=0 to disable, or BOLTZGEN_ALIGN_LOG_EVERY_N=N
+        # to subsample on long runs.
+        if os.environ.get("BOLTZGEN_ALIGN_LOG", "1") != "0":
+            callbacks.append(AlignmentLogger())
+
         # Create wandb logger
         loggers = []
         if self.wandb:
@@ -237,6 +247,8 @@ class Training(Task):
         if not self.strict_loading:
             model_module.strict_loading = False
 
+        _log_musa_memory("pre-fit (post model load, pre trainer.fit)")
+
         if self.validation_only:
             trainer.validate(
                 model_module,
@@ -249,3 +261,54 @@ class Training(Task):
                 datamodule=data_module,
                 ckpt_path=ckpt_path,
             )
+
+
+def _log_musa_memory(tag: str) -> None:
+    """Print MUSA device-level vs PyTorch-allocator memory.
+
+    The whole point is to surface the gap between what the device thinks is in
+    use (mem_get_info -> what musa-smi sees) and what PyTorch's caching
+    allocator knows about (memory_allocated / memory_reserved). Anything in the
+    gap is held by muDNN workspace, MCCL buffers, math fallback scratch, or
+    other allocations that bypass torch's caching allocator.
+    """
+    if not (hasattr(torch, "musa") and torch.musa.is_available()):
+        return
+    rank = os.environ.get("LOCAL_RANK", os.environ.get("RANK", "?"))
+    try:
+        dev = torch.musa.current_device()
+    except Exception:
+        dev = "?"
+    msg_parts = [f"[MUSA mem][rank {rank}][dev {dev}][{tag}]"]
+    if hasattr(torch.musa, "mem_get_info"):
+        try:
+            free_b, total_b = torch.musa.mem_get_info()
+            used_b = total_b - free_b
+            msg_parts.append(
+                f"device: total={total_b/2**30:.2f}GiB "
+                f"used={used_b/2**30:.2f}GiB free={free_b/2**30:.2f}GiB"
+            )
+        except Exception as e:  # noqa: BLE001
+            msg_parts.append(f"device: mem_get_info failed: {e!r}")
+    else:
+        msg_parts.append("device: mem_get_info unavailable on this torch_musa")
+    try:
+        alloc_b = torch.musa.memory_allocated()
+        reserved_b = torch.musa.memory_reserved()
+        msg_parts.append(
+            f"pytorch: allocated={alloc_b/2**30:.2f}GiB reserved={reserved_b/2**30:.2f}GiB"
+        )
+        # The actionable diff: anything in 'used - reserved' is held by something
+        # outside PyTorch's caching allocator (workspaces, MCCL, fallback scratch).
+        if hasattr(torch.musa, "mem_get_info"):
+            try:
+                free_b, total_b = torch.musa.mem_get_info()
+                external_b = max(0, (total_b - free_b) - reserved_b)
+                msg_parts.append(
+                    f"non-pytorch (used - reserved) ~= {external_b/2**30:.2f}GiB"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as e:  # noqa: BLE001
+        msg_parts.append(f"pytorch: memory_* query failed: {e!r}")
+    print(" | ".join(msg_parts), flush=True)

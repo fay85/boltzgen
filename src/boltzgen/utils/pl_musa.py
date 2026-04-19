@@ -21,6 +21,11 @@ from pytorch_lightning.strategies.ddp import DDPStrategy
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
 
 try:
+    from pytorch_lightning.plugins import MixedPrecision
+except ImportError:  # pragma: no cover - older PL layouts
+    from pytorch_lightning.plugins.precision import MixedPrecision  # type: ignore[no-redef]
+
+try:
     from omegaconf import ListConfig
 except ImportError:
     ListConfig = ()  # type: ignore[misc, assignment]
@@ -126,6 +131,26 @@ class MUSACUDAAccelerator(CUDAAccelerator):
         return torch.musa.memory_stats(device)
 
 
+class MUSAMixedPrecision(MixedPrecision):
+    """Lightning ``MixedPrecision`` wired to ``torch.autocast('musa', ...)``.
+
+    PL's stock ``MixedPrecision`` defaults to ``device='cuda'``. Our
+    :class:`MUSACUDAAccelerator` masquerades as CUDA so the precision connector
+    happily picks ``MixedPrecision('bf16-mixed', 'cuda')``, but the autocast
+    that produces is a no-op for tensors on ``musa:0``. This subclass forces
+    ``device='musa'`` so the autocast actually fires on MUSA tensors.
+    """
+
+    def __init__(self, precision: str = "bf16-mixed") -> None:
+        if precision != "bf16-mixed":
+            raise MisconfigurationException(
+                f"MUSAMixedPrecision only supports 'bf16-mixed' on this stack, "
+                f"got {precision!r}. 16-mixed needs a MUSA GradScaler wiring; "
+                "bf16-true / 16-true require model-level removal of .float() upcasts."
+            )
+        super().__init__(precision=precision, device="musa", scaler=None)
+
+
 def patch_trainer_kwargs_for_musa(trainer_cfg: dict) -> None:
     """Mutate Lightning ``Trainer`` kwargs so ``gpu`` / ``cuda`` / ``auto`` work without NVIDIA CUDA."""
     if not _is_musa_lightning_runtime():
@@ -140,16 +165,37 @@ def patch_trainer_kwargs_for_musa(trainer_cfg: dict) -> None:
     trainer_cfg["accelerator"] = MUSACUDAAccelerator()
 
     prec = trainer_cfg.get("precision")
-    if prec in ("bf16-mixed", "16-mixed"):
+    # Precision policy on MUSA / muDNN:
+    #
+    #   * bf16-mixed: supported via MUSAMixedPrecision below. We must inject the
+    #     plugin (rather than passing precision=) so PL routes autocast through
+    #     'musa' instead of 'cuda'. PL forbids passing `precision=` and a
+    #     MixedPrecision plugin together, so we pop the kwarg.
+    #
+    #   * 16-mixed: would need a MUSA GradScaler (torch_musa.core.amp.GradScaler).
+    #     Not wired up here -- fall back to fp32 with a warning.
+    #
+    #   * bf16-true / 16-true: PL casts every parameter to low precision. The
+    #     model intentionally upcasts many activations with `.float()` (in
+    #     encoders.py / diffusion.py / loss/*.py), so nn.Linear ends up with
+    #     (input=fp32, weight=bf16, bias=bf16) and muDNN raises:
+    #         NOT_SUPPORTED in MatMul::RunWithBiasAdd
+    #             unsupported data type BFLOAT16,FLOAT,BFLOAT16,,BFLOAT16
+    #     Removing every `.float()` upcast is invasive; fall back to fp32 here.
+    if prec == "bf16-mixed":
+        plugins = trainer_cfg.setdefault("plugins", [])
+        plugins.append(MUSAMixedPrecision("bf16-mixed"))
+        trainer_cfg.pop("precision", None)
+    elif prec in ("16-mixed", "bf16-true", "16-true"):
         warnings.warn(
-            f"Trainer precision {prec!r} uses torch.autocast('cuda', ...) in PyTorch Lightning, "
-            "which is not valid on MUSA-only hosts. Using "
-            f"{'bf16-true' if prec == 'bf16-mixed' else '16-true'} instead "
-            "(BoltzGen already applies explicit MUSA autocast where needed).",
+            f"Trainer precision {prec!r} is not supported on MUSA with this model "
+            "(muDNN MatMul cannot mix FLOAT/BFLOAT16 operands; see "
+            "'unsupported data type BFLOAT16,FLOAT,BFLOAT16,,BFLOAT16'). "
+            "Using precision 32 instead. Use 'bf16-mixed' for MUSA AMP.",
             UserWarning,
             stacklevel=2,
         )
-        trainer_cfg["precision"] = "bf16-true" if prec == "bf16-mixed" else "16-true"
+        trainer_cfg["precision"] = 32
 
 
 class MUSADDPStrategy(DDPStrategy):

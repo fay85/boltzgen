@@ -119,12 +119,23 @@ class AttentionPairBias(nn.Module):
         attn_mask = attn_mask + bias.float()
 
         with torch.autocast("musa", enabled=False):
-            # Compute attention weights
+            # MUSA's SDPA dispatcher only supports {Half, BFloat16} (see
+            # ATen/native/transformers/sdp_utils_cpp.h:90). Feeding it fp32 emits
+            # "Expected query, key and value to all be of dtype: {Half, BFloat16}"
+            # and silently falls back to a math kernel that materializes the
+            # B*H*N*N attention matrix in fp32 -- ~2x the bf16-mixed memory
+            # footprint and an OOM hazard. So on MUSA we run SDPA in bf16;
+            # on CUDA we keep the original fp32 path the upstream model authors
+            # picked (cuDNN's SDPA accepts fp32 natively).
+            if q.is_musa:
+                sdpa_dtype = torch.bfloat16
+            else:
+                sdpa_dtype = torch.float32
             o = torch.nn.functional.scaled_dot_product_attention(
-                q.float(),
-                k.float(),
-                v.float(),
-                attn_mask=attn_mask,
+                q.to(sdpa_dtype),
+                k.to(sdpa_dtype),
+                v.to(sdpa_dtype),
+                attn_mask=attn_mask.to(sdpa_dtype),
             )
 
         o = o.permute(0, 2, 1, 3).reshape(B, -1, self.c_s)
