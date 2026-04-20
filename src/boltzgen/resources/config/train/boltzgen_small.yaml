@@ -19,7 +19,7 @@ name: small
 output: workdir
 strict_loading: false
 resume: null
-pretrained: ./training_data/boltzgen1_structuretrained_small.ckpt
+pretrained: /data/boltzGen_dataset/boltzgen1_structuretrained_small.ckpt
 debug: false
 save_every_n_train_steps: 2500
 disable_checkpoint: false
@@ -30,8 +30,8 @@ save_top_k: -1
 data:
   datasets:
     - _target_: boltzgen.task.train.data.DatasetConfig
-      target_dir: ./training_data/targets
-      msa_dir: ./training_data/msa
+      target_dir: /data/boltzGen_datasettargets
+      msa_dir: /data/boltzGen_dataset/msa
       prob: 1
       filters:
         - _target_: boltzgen.data.filter.dynamic.size.SizeFilter
@@ -57,7 +57,7 @@ data:
     atomize_modified_residues: false
   featurizer:
     _target_: boltzgen.data.feature.featurizer.Featurizer
-  moldir: ./training_data/mols
+  moldir: /data/boltzGen_dataset/mols
   max_tokens: 256
   max_atoms: 2048
   max_seqs: 1024
@@ -101,12 +101,12 @@ data:
 
   # Design datasets
   monomer_split: ./src/boltzgen/resources/splits/val_monomers_boltzgen_min50_max220.txt
-  monomer_target_dir: ./training_data/targets
+  monomer_target_dir: /data/boltzGen_dataset/targets
   monomer_target_structure_condition: true
   monomer_seq_len: 100
 
   ligand_split: ./src/boltzgen/resources/splits/val_ccd_pdb_pairs_boltzgen.txt
-  ligand_target_dir: ./training_data/targets
+  ligand_target_dir: /data/boltzGen_dataset/targets
   ligand_seq_len: 100
 
 
@@ -335,7 +335,7 @@ model:
           suffix_native: _native.cif
           samples_per_target: 1
           num_targets: 100000000
-          moldir: ./training_data/mols
+          moldir: /data/boltzGen_dataset/mols
 
           batch_size: 1
           num_workers: 4
@@ -343,7 +343,7 @@ model:
         target_templates: true
         return_native: true
 
-    folding_checkpoint: ./training_data/boltz2_fold.ckpt
+    folding_checkpoint: /data/boltzGen_dataset/boltz2_fold.ckpt
 
     folding_args:
       recycling_steps: 3
