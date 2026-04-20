@@ -1257,14 +1257,20 @@ def process_atom_features(
                 and token_atoms["is_present"][idx_frame_c]
             )
         elif (
-            token["mol_type"] == const.chain_type_ids["DNA"]
-            or token["mol_type"] == const.chain_type_ids["RNA"]
-        ) and (res_name in const.ref_atoms):
+            (token["mol_type"] == const.chain_type_ids["DNA"]
+            or token["mol_type"] == const.chain_type_ids["RNA"])
+            and (res_name in const.ref_atoms)
+            and all(
+                name in const.ref_atoms[res_name]
+                for name in ("C1'", "C3'", "C4'", "P")
+            )
+        ):
+            ra = const.ref_atoms[res_name]
             idx_frame_a, idx_frame_b, idx_frame_c, idx_frame_d = (
-                const.ref_atoms[res_name].index("C1'"),
-                const.ref_atoms[res_name].index("C3'"),
-                const.ref_atoms[res_name].index("C4'"),
-                const.ref_atoms[res_name].index("P"),
+                ra.index("C1'"),
+                ra.index("C3'"),
+                ra.index("C4'"),
+                ra.index("P"),
             )
             mask_frame = (
                 token_atoms["is_present"][idx_frame_a]

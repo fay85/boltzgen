@@ -14,6 +14,7 @@ from pytorch_lightning.strategies import DDPStrategy
 
 from boltzgen.task.task import Task
 from boltzgen.task.train.data import DataConfig, TrainingDataModule
+from boltzgen.utils.align_logger import AlignmentLogger
 
 
 class Training(Task):
@@ -164,6 +165,15 @@ class Training(Task):
                 every_n_epochs=1,
             )
             callbacks.append(mc)
+
+        # Always-on alignment logger: emits one '[ALIGN] step=... loss=...'
+        # line per training step on rank 0 in a format that's byte-identical
+        # between the CUDA and MUSA forks. Used to compare numerical training
+        # behaviour between the two stacks; see boltzgen/utils/align_logger.py.
+        # Set BOLTZGEN_ALIGN_LOG=0 to disable, or BOLTZGEN_ALIGN_LOG_EVERY_N=N
+        # to subsample on long runs.
+        if os.environ.get("BOLTZGEN_ALIGN_LOG", "1") != "0":
+            callbacks.append(AlignmentLogger())
 
         # Create wandb logger
         loggers = []

@@ -130,8 +130,16 @@ model:
   bond_type_feature: true
   predict_bfactor: true
   predict_res_type: false
-  checkpoint_diffusion_conditioning: false
-  use_kernels: true
+  # Kept identical to the MUSA fork (boltzgen, branch musa) so that train-loss
+  # trajectories from the two stacks are directly comparable via
+  # compare_align_logs.py. cuEquivariance fused triangle kernels (use_kernels)
+  # produce slightly different numerics from the math fallback that MUSA must
+  # use (kernel package is CUDA-only); turning them off here forces both stacks
+  # through the same code path. Activation checkpointing is mathematically a
+  # no-op on the loss (recompute, not approximation), but matches the MUSA
+  # fork's memory profile so step times are also more comparable.
+  checkpoint_diffusion_conditioning: true
+  use_kernels: false
 
 
   validators:
@@ -164,7 +172,7 @@ model:
     template_dim: 64
     template_blocks: 2
     miniformer_blocks: true
-    activation_checkpointing: false
+    activation_checkpointing: true
 
   use_token_distances: true
   token_distance_args:
@@ -182,14 +190,14 @@ model:
     pairwise_head_width: 32
     pairwise_num_heads: 4
     use_paired_feature: true
-    activation_checkpointing: false
+    activation_checkpointing: true
 
   pairformer_args:
     num_blocks: 12
     num_heads: 16
     dropout: 0.25
     post_layer_norm: false
-    activation_checkpointing: false
+    activation_checkpointing: true
 
   score_model_args:
     sigma_data: 16
@@ -211,7 +219,7 @@ model:
     atom_decoder_heads: 4
     conditioning_transition_layers: 2
     transformer_post_ln: false
-    activation_checkpointing: false
+    activation_checkpointing: true
 
   confidence_prediction: false
   structure_prediction_training: true

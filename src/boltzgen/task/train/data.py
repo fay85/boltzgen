@@ -1,8 +1,12 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+import os
+import re
+import sys
+import time
 import traceback
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,6 +34,221 @@ from boltzgen.data.sample.sampler import Sample, Sampler
 from boltzgen.data.template.features import load_dummy_templates
 from boltzgen.data.tokenize.tokenizer import Tokenizer
 from boltzgen.task.predict import data_ligands, data_protein_binder
+
+
+# --- DataLoader sample-retry plumbing ----------------------------------------
+#
+# The training/validation `__getitem__` paths used to recover from per-sample
+# featurizer / cropper / selector failures by *recursing* into a freshly picked
+# index, and by calling `traceback.print_exc()` on every failure. Both are
+# dangerous in this dataset (which contains a non-trivial fraction of samples
+# the featurizer rejects, e.g. nucleic-acid residues missing the C1' atom or
+# multimers whose cropper hits the safety bail-out):
+#
+#   1. Recursion has no bound. With ~5-10% bad samples and 8 ranks * N workers
+#      retrying, a worker eventually hits Python's recursion limit, raises
+#      RecursionError, and dies *silently* -- the DataLoader then hangs without
+#      surfacing the real cause. (The validation path was even worse: it
+#      retried on `__getitem__(0)`, so a bad sample at index 0 would loop on
+#      the same bad sample forever.)
+#
+#   2. Each retry prints a full multi-line traceback. With many workers, this
+#      drowns the log -- to the point that real progress messages and real
+#      crashes are invisible.
+#
+# The two helpers below replace recursion with a bounded loop, and throttle
+# the noisy traceback printing on a per-(stage, error-class) basis so the log
+# stays readable without losing the first occurrence of any new failure mode.
+
+
+class _SkipSample(Exception):  # noqa: N818
+    """Sentinel raised by per-stage handlers in `_fetch_one` to signal
+    'this sample is unusable, please try a different index'.
+
+    Caught only by the bounded retry loop in `__getitem__`; never propagates
+    past the dataset boundary."""
+
+
+_SAMPLE_FAILURE_COUNTS: Dict[str, int] = defaultdict(int)
+_MAX_TRACEBACKS_PER_ERROR_KEY = 3
+_MAX_FETCH_RETRIES = 64
+
+# Per-worker successful-fetch counters + first-fetch timestamp, keyed by pid so
+# the main process and each DataLoader subprocess get their own counter. Used by
+# `_retry_fetch` to emit a periodic "still serving samples" heartbeat.
+_HEARTBEAT_COUNTS: Dict[int, int] = defaultdict(int)
+_HEARTBEAT_FIRST_TS: Dict[int, float] = {}
+_HEARTBEAT_EVERY = int(os.environ.get("BOLTZGEN_DATA_HEARTBEAT_EVERY", "50"))
+
+
+# Known-benign per-sample failure modes that are part of normal dataset triage,
+# not bugs. For these we never print a traceback (it just looks like a crash to
+# anyone reading the log, even though the worker has already moved on to the
+# next sample). Each entry maps a regex over the stage name to a list of
+# (exception-class-name, message-substring-regex, short-reason) tuples. The
+# *first* matching tuple wins.
+_BENIGN_SAMPLE_FAILURES: List[Tuple[re.Pattern[str], str, re.Pattern[str], str]] = [
+    (
+        re.compile(r"^(Cropper|Selector)( \(val\))?$"),
+        "Exception",
+        re.compile(r"Infinite loop in cropper while loop"),
+        "cropper exhausted retries (no valid crop for this sample) -> trying another sample",
+    ),
+    (
+        re.compile(r"^(Cropper|Selector)( \(val\))?$"),
+        "ValueError",
+        re.compile(r"high <= 0"),
+        "cropper interface picker found no candidate tokens (no interface in this sample) -> trying another sample",
+    ),
+    (
+        re.compile(r"^Featurizer( \(val\))?$"),
+        "ValueError",
+        re.compile(r"is not in list"),
+        "atom/residue name missing from sample -> trying another sample",
+    ),
+    (
+        re.compile(r"^(Featurizer|Selector|Cropper)( \(val\))?$"),
+        "IndexError",
+        re.compile(r"arrays used as indices must be of integer \(or boolean\) type"),
+        "malformed index array on this sample -> trying another sample",
+    ),
+    (
+        re.compile(r".*"),
+        "Exception",
+        re.compile(r"Inverse fold too few design residues"),
+        "inverse-fold sample has too few design residues -> trying another sample",
+    ),
+]
+
+
+def _classify_benign(stage: str, exc: BaseException) -> Optional[str]:
+    """Return a short human reason if `exc` at `stage` is a known-benign data
+    issue (will print as a one-liner with no traceback), else None (will print
+    with a full first-occurrence traceback so unknown bugs stay visible)."""
+    exc_name = type(exc).__name__
+    msg = str(exc)
+    for stage_re, want_exc, msg_re, reason in _BENIGN_SAMPLE_FAILURES:
+        if want_exc != exc_name:
+            continue
+        if not stage_re.match(stage):
+            continue
+        if not msg_re.search(msg):
+            continue
+        return reason
+    return None
+
+
+def _log_sample_failure(stage: str, record_id: object, exc: BaseException) -> None:
+    """Throttled per-sample failure logger.
+
+    All output is routed to `sys.stderr` with `flush=True`. This is mandatory
+    in DataLoader worker subprocesses, where stdout is block-buffered (an 8 KiB
+    pipe buffer); workers can be killed/cycled long before that buffer fills,
+    silently swallowing prefix lines.
+    """
+    key = f"{stage}|{type(exc).__name__}|{str(exc)[:80]}"
+    seen = _SAMPLE_FAILURE_COUNTS[key]
+    _SAMPLE_FAILURE_COUNTS[key] = seen + 1
+
+    benign_reason = _classify_benign(stage, exc)
+    if benign_reason is not None:
+        if seen == 0:
+            print(  # noqa: T201
+                f"[Sample skip] [{stage}] record={record_id!r}: "
+                f"{benign_reason} ({type(exc).__name__}: {exc}). "
+                f"(known-benign, no traceback; further occurrences will be summarized.)",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif seen < _MAX_TRACEBACKS_PER_ERROR_KEY:
+            print(  # noqa: T201
+                f"[Sample skip] [{stage}] record={record_id!r}: "
+                f"{benign_reason} (occurrence {seen + 1})",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif seen == _MAX_TRACEBACKS_PER_ERROR_KEY:
+            print(  # noqa: T201
+                f"[Sample skip] [{stage}] suppressing further messages for this "
+                f"(stage, reason) -- now seen {seen + 1} times in this worker.",
+                file=sys.stderr,
+                flush=True,
+            )
+        return
+
+    if seen == 0:
+        print(  # noqa: T201
+            f"[Sample fail] [{stage}] record={record_id!r} "
+            f"({type(exc).__name__}: {exc}). Skipping. "
+            f"(First occurrence of an UNKNOWN failure mode; full traceback below "
+            f"so it can be triaged; further occurrences will be summarized. "
+            f"Add it to _BENIGN_SAMPLE_FAILURES once confirmed safe.)",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+    elif seen < _MAX_TRACEBACKS_PER_ERROR_KEY:
+        print(  # noqa: T201
+            f"[Sample fail] [{stage}] record={record_id!r} "
+            f"({type(exc).__name__}: {exc}). Skipping. (occurrence {seen + 1})",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif seen == _MAX_TRACEBACKS_PER_ERROR_KEY:
+        print(  # noqa: T201
+            f"[Sample fail] [{stage}] suppressing further messages for this "
+            f"(stage, exception) -- now seen {seen + 1} times in this worker.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _retry_fetch(
+    fetch_one: Callable[[int], Dict[str, Tensor]],
+    idx: int,
+    next_idx: Callable[[int], int],
+) -> Dict[str, Tensor]:
+    """Call `fetch_one(idx)` and, on `_SkipSample`, retry with `next_idx(attempt)`.
+
+    Bounded by `_MAX_FETCH_RETRIES`. Raises if every retry hits `_SkipSample` --
+    that path is reserved for genuinely-broken datasets, so the failure is
+    loud rather than silent like the previous recursion-driven hang.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_MAX_FETCH_RETRIES):
+        cur_idx = idx if attempt == 0 else next_idx(attempt)
+        try:
+            sample = fetch_one(cur_idx)
+        except _SkipSample as e:
+            last_exc = e
+            continue
+        _heartbeat_after_success(attempt=attempt, idx=cur_idx)
+        return sample
+    raise RuntimeError(
+        f"DataLoader worker exhausted {_MAX_FETCH_RETRIES} retries while looking "
+        f"for a usable sample. Last skip reason: {last_exc!r}. The dataset is "
+        f"likely misconfigured (wrong path, wrong split, or the failure rate "
+        f"of the featurizer/selector/cropper is too high)."
+    )
+
+
+def _heartbeat_after_success(attempt: int, idx: int) -> None:
+    """Periodic 'this DataLoader worker is alive and serving samples' message."""
+    pid = os.getpid()
+    count = _HEARTBEAT_COUNTS[pid] + 1
+    _HEARTBEAT_COUNTS[pid] = count
+    if pid not in _HEARTBEAT_FIRST_TS:
+        _HEARTBEAT_FIRST_TS[pid] = time.monotonic()
+    if _HEARTBEAT_EVERY > 0 and (count == 1 or count % _HEARTBEAT_EVERY == 0):
+        elapsed = time.monotonic() - _HEARTBEAT_FIRST_TS[pid]
+        rate = count / elapsed if elapsed > 0 else float("inf")
+        print(  # noqa: T201
+            f"[Data heartbeat] pid={pid} served={count} "
+            f"elapsed={elapsed:.1f}s rate={rate:.2f}/s "
+            f"last_idx={idx} last_attempt={attempt}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 @dataclass
@@ -359,6 +578,23 @@ class TrainingDataset(torch.utils.data.Dataset):
             self.samples_weight.append(samples["weight"].tolist())
 
     def __getitem__(self, idx: int) -> Dict[str, Tensor]:
+        """Bounded-retry wrapper around `_fetch_one`.
+
+        Catches `_SkipSample` and retries with a freshly-drawn random index
+        (matching the original "pick a different sample on failure" behaviour),
+        but unlike the previous recursion-based implementation it cannot blow
+        Python's recursion limit and it raises a loud RuntimeError if every
+        retry fails. See module-level comment on `_retry_fetch`.
+        """
+        rng = np.random.default_rng()
+        n = len(self)
+        return _retry_fetch(
+            self._fetch_one,
+            idx,
+            next_idx=lambda _attempt: int(rng.integers(0, n)),
+        )
+
+    def _fetch_one(self, idx: int) -> Dict[str, Tensor]:
         """Get an item from the dataset.
 
         Returns
@@ -408,8 +644,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         try:
             structure = load_structure(record, dataset.struct_dir)
         except Exception as e:  # noqa: BLE001
-            print(f"Failed to load input for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(random.integers(0, len(self)))
+            _log_sample_failure("Structure load", record.id, e)
+            raise _SkipSample("structure-load") from None
 
         # Tokenize structure
         try:
@@ -417,9 +653,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                 structure, inverse_fold=self.inverse_fold
             )
         except Exception as e:  # noqa: BLE001
-            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")
-            traceback.print_exc()  # noqa: T201
-            return self.__getitem__(random.integers(0, len(self)))
+            _log_sample_failure("Tokenizer", record.id, e)
+            raise _SkipSample("tokenize") from None
 
         # Compute crop
         try:
@@ -437,9 +672,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                     msg = "No tokens in cropped structure."
                     raise ValueError(msg)  # noqa: TRY301
         except Exception as e:  # noqa: BLE001
-            print(f"Cropper failed on {record.id} with error {e}. Skipping.")
-            traceback.print_exc()  # noqa: T201
-            return self.__getitem__(random.integers(0, len(self)))
+            _log_sample_failure("Cropper", record.id, e)
+            raise _SkipSample("crop") from None
 
         # Select which tokens to design
         try:
@@ -448,9 +682,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                 random=random,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"Selector failed on {record.id} with error {e}. Skipping.")  # noqa: T201
-            traceback.print_exc()  # noqa: T201
-            return self.__getitem__(random.integers(0, len(self)))
+            _log_sample_failure("Selector", record.id, e)
+            raise _SkipSample("select") from None
         structure = tokenized.structure
 
         # Get unique chain ids
@@ -467,8 +700,8 @@ class TrainingDataset(torch.utils.data.Dataset):
             else:
                 msas = {}
         except Exception as e:  # noqa: BLE001
-            print(f"MSA loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(random.integers(0, len(self)))
+            _log_sample_failure("MSA loading", record.id, e)
+            raise _SkipSample("msa-load") from None
 
         # Load molecules
         try:
@@ -484,8 +717,8 @@ class TrainingDataset(torch.utils.data.Dataset):
             mol_names = mol_names - set(molecules.keys())
             molecules.update(load_molecules(self.moldir, mol_names))
         except Exception as e:  # noqa: BLE001
-            print(f"Molecule loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(random.integers(0, len(self)))
+            _log_sample_failure("Molecule loading", record.id, e)
+            raise _SkipSample("mol-load") from None
 
         # Finalize input data
         input_data = Input(
@@ -527,14 +760,13 @@ class TrainingDataset(torch.utils.data.Dataset):
                 inverse_fold=self.inverse_fold,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
-            traceback.print_exc()
-            return self.__getitem__(random.integers(0, len(self)))
+            _log_sample_failure("Featurizer", record.id, e)
+            raise _SkipSample("featurize") from None
 
         # Check that there is enough stuff to design in the inverse folding case so we have no nan losses
         if self.inverse_fold and features["design_mask"].sum() < 3:
-            print(f"Skipping {record.id}. Fewer than 3 design residues.")
-            return self.__getitem__(random.integers(0, len(self)))
+            print(f"Skipping {record.id}. Fewer than 3 design residues.")  # noqa: T201
+            raise _SkipSample("inverse-fold-too-few-design-residues")
 
         # Set template features
         template_features = load_dummy_templates(
@@ -638,6 +870,22 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.disulfide_on = disulfide_on
 
     def __getitem__(self, idx: int) -> Structure:
+        """Bounded-retry wrapper around `_fetch_one`.
+
+        Validation is meant to be deterministic, so on `_SkipSample` we step
+        forward (idx, idx+1, idx+2, ... mod len) instead of picking a random
+        replacement -- and we never re-pick the same idx, which the previous
+        implementation did (it called `__getitem__(0)` on every failure, so a
+        single bad sample at index 0 would loop forever).
+        """
+        n = self.__len__()
+        return _retry_fetch(
+            self._fetch_one,
+            idx,
+            next_idx=lambda attempt: (idx + attempt) % n,
+        )
+
+    def _fetch_one(self, idx: int) -> Structure:
         """Get an item from the dataset.
 
         Returns
@@ -667,15 +915,15 @@ class ValidationDataset(torch.utils.data.Dataset):
         try:
             structure = load_structure(record, dataset.struct_dir)
         except Exception as e:  # noqa: BLE001
-            print(f"Failed to load input for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            _log_sample_failure("Structure load (val)", record.id, e)
+            raise _SkipSample("structure-load") from None
 
         # Tokenize structure
         try:
             tokenized = dataset.tokenizer.tokenize(structure)
         except Exception as e:  # noqa: BLE001
-            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
-            return self.__getitem__(0)
+            _log_sample_failure("Tokenizer (val)", record.id, e)
+            raise _SkipSample("tokenize") from None
 
         # Compute crop
         try:
@@ -693,8 +941,8 @@ class ValidationDataset(torch.utils.data.Dataset):
                     msg = "No tokens in cropped structure."
                     raise ValueError(msg)  # noqa: TRY301
         except Exception as e:  # noqa: BLE001
-            print(f"Cropper failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            _log_sample_failure("Cropper (val)", record.id, e)
+            raise _SkipSample("crop") from None
 
         # Get unique chains
         chain_ids = set(np.unique(tokenized.tokens["asym_id"]).tolist())
@@ -703,8 +951,8 @@ class ValidationDataset(torch.utils.data.Dataset):
         try:
             msas = load_msas(chain_ids, record, dataset.msa_dir)
         except Exception as e:  # noqa: BLE001
-            print(f"MSA loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            _log_sample_failure("MSA loading (val)", record.id, e)
+            raise _SkipSample("msa-load") from None
 
         # Select which tokens to design
         try:
@@ -713,9 +961,8 @@ class ValidationDataset(torch.utils.data.Dataset):
                 random=random,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"Selector failed on {sample.record_id} with error {e}. Skipping.")  # noqa: T201
-            traceback.print_exc()  # noqa: T201
-            return self.__getitem__(0)
+            _log_sample_failure("Selector (val)", sample.record_id, e)
+            raise _SkipSample("select") from None
         structure = tokenized.structure
 
         try:
@@ -731,8 +978,8 @@ class ValidationDataset(torch.utils.data.Dataset):
             mol_names = mol_names - set(molecules.keys())
             molecules.update(load_molecules(self.moldir, mol_names))
         except Exception as e:  # noqa: BLE001
-            print(f"Molecule loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            _log_sample_failure("Molecule loading (val)", record.id, e)
+            raise _SkipSample("mol-load") from None
 
         # Finalize input data
         input_data = Input(
@@ -773,13 +1020,13 @@ class ValidationDataset(torch.utils.data.Dataset):
                 disulfide_on=self.disulfide_on,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            _log_sample_failure("Featurizer (val)", record.id, e)
+            raise _SkipSample("featurize") from None
 
         # Check that there is enough stuff to design in the inverse folding case so we have no nan losses
         if self.inverse_fold and features["design_mask"].sum() < 3:
-            print(f"Skipping {record.id}. Fewer than 3 design residues.")
-            return self.__getitem__(0)
+            print(f"Skipping {record.id}. Fewer than 3 design residues.")  # noqa: T201
+            raise _SkipSample("inverse-fold-too-few-design-residues")
 
         # Set template features
         template_features = load_dummy_templates(

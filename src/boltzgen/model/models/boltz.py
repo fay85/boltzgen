@@ -870,6 +870,11 @@ class Boltz(LightningModule):
         dict_out["s_trunk"] = s
         return dict_out
 
+    def _zero_train_loss(self) -> Tensor:
+        """Scalar zero loss on the module graph; DDP does not allow skipping the step with None."""
+        p = next(self.parameters())
+        return (p * 0).sum()
+
     def training_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Tensor:
         start = time.time()
 
@@ -924,7 +929,7 @@ class Boltz(LightningModule):
                     )
                 except Exception as e:
                     print(f"Skipping batch {batch_idx} due to error: {e}")
-                    return None
+                    return self._zero_train_loss()
             else:
                 disto_loss = 0.0
                 diffusion_loss_dict = {"loss": 0.0, "loss_breakdown": {}}
@@ -956,7 +961,7 @@ class Boltz(LightningModule):
                 )
             except Exception as e:
                 print(f"Skipping batch with id {batch['pdb_id']} due to error: {e}")
-                return None
+                return self._zero_train_loss()
 
             true_coords = return_dict["true_coords"]
             true_coords_resolved_mask = return_dict["true_coords_resolved_mask"]
