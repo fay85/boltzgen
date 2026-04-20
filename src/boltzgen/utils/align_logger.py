@@ -113,6 +113,12 @@ class AlignmentLogger(Callback):
         self.every_n_steps = max(1, int(every_n_steps))
         self.every_rank = bool(every_rank)
         self.stream = stream
+        # Guard against duplicate emissions when accumulate_grad_batches > 1:
+        # `on_train_batch_end` fires once per micro-batch, but `global_step`
+        # only ticks once per optimizer step, so naive emission produces N
+        # identical lines per step (where N = accumulate_grad_batches).
+        # Track the last step we emitted (per rank) and skip repeats.
+        self._last_emitted_step: int = -1
 
     def on_train_batch_end(
         self,
@@ -126,8 +132,11 @@ class AlignmentLogger(Callback):
         if (not self.every_rank) and rank != 0:
             return
         step = trainer.global_step
+        if step == self._last_emitted_step:
+            return
         if step % self.every_n_steps != 0:
             return
+        self._last_emitted_step = step
         epoch = trainer.current_epoch
 
         loss = _loss_from_outputs(outputs)
