@@ -119,14 +119,22 @@ class AttentionPairBias(nn.Module):
         attn_mask = attn_mask + bias.float()
 
         with torch.autocast("musa", enabled=False):
-            # MUSA's SDPA dispatcher only supports {Half, BFloat16} (see
-            # ATen/native/transformers/sdp_utils_cpp.h:90). Feeding it fp32 emits
-            # "Expected query, key and value to all be of dtype: {Half, BFloat16}"
-            # and silently falls back to a math kernel that materializes the
-            # B*H*N*N attention matrix in fp32 -- ~2x the bf16-mixed memory
-            # footprint and an OOM hazard. So on MUSA we run SDPA in bf16;
-            # on CUDA we keep the original fp32 path the upstream model authors
-            # picked (cuDNN's SDPA accepts fp32 natively).
+            # SDPA dtype policy on this fork:
+            #
+            # Inference (the only path this branch exercises today): fp32. MUSA's
+            # flash-SDPA dispatcher rejects fp32 q/k/v and falls back to PyTorch's
+            # math kernel. Under torch.no_grad() that's fine -- the math kernel
+            # materializes a transient B*H*N*N attention matrix but it's freed
+            # before the next layer (no activation save), so memory cost is
+            # small and numerics are equivalent to CUDA's fp32 SDPA call within
+            # cuDNN-vs-muDNN matmul reduction-order noise.
+            #
+            # Training note: under bf16-mixed the same fp32 -> math-kernel
+            # fallback also stores activations for backward and ~2x the
+            # bf16 footprint, which OOMs at our shapes. If/when training
+            # exercises this layer again, switch sdpa_dtype to torch.bfloat16
+            # so MUSA's flash kernel (which requires {Half, BFloat16}) is used
+            # instead of the math fallback.
             sdpa_dtype = torch.float32
             o = torch.nn.functional.scaled_dot_product_attention(
                 q.to(sdpa_dtype),
