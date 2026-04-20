@@ -403,26 +403,18 @@ def get_indexing_matrix(K, W, H, device):
 
 
 def single_to_keys(single, indexing_matrix, W, H):
-    """Map per-(query-window, slot) features to key layout.
-
-    Implemented as one 2D ``matmul`` instead of ``einsum``: in full BoltzGen
-    training on some MUSA+MUDNN stacks the original contraction raised
-    ``BmmCall MUDNN failed`` (stack pointed at ``einsum``; a minimal einsum
-    parity test can still pass, so the failure is likely context-dependent).
-    The GEMM layout matches the same math and avoids that code path.
-    """
+    # Reverted to upstream einsum after `test_einsum_cuda_vs_musa.py` confirmed
+    # this contraction now succeeds on torch_musa for fp32 + bf16. The previous
+    # explicit GEMM rewrite (kept in git history) was added when full-model
+    # training raised `BmmCall MUDNN failed` here on some MUSA+muDNN stacks.
+    # If that error returns, restore the GEMM form -- it is mathematically
+    # equivalent (same contraction, different reduction order).
     B, N, D = single.shape
     K = N // W
-    J = 2 * K
-    I = W // 2
-    single = single.view(B, J, I, D)
-    jm, km = indexing_matrix.shape
-    assert jm == J, (jm, J)
-    x = single.permute(0, 2, 3, 1).reshape(B * I * D, J).contiguous()
-    im = indexing_matrix.to(device=x.device, dtype=x.dtype).contiguous()
-    out = x @ im
-    out = out.view(B, I, D, km).permute(0, 3, 1, 2).contiguous()
-    return out.reshape(B, K, H, D)
+    single = single.view(B, 2 * K, W // 2, D)
+    return torch.einsum("b j i d, j k -> b k i d", single, indexing_matrix).reshape(
+        B, K, H, D
+    )  # j = 2K, i = W//2, k = h * K
 
 
 class AtomEncoder(Module):
