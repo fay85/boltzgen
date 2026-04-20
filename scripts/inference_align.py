@@ -181,6 +181,121 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[st
     return out
 
 
+def load_boltz_no_pl_to_device(
+    checkpoint_path: Path,
+    predict_args: Dict[str, Any],
+):
+    """Load a Boltz LightningModule WITHOUT triggering PL's `model.to(device)`.
+
+    Why this exists: ``Boltz.load_from_checkpoint(...)`` ends with
+    ``return model.to(device)`` (PL's saving.py:101). On MUSA-only hosts that
+    chain hits ``torchmetrics.Metric._apply`` -> ``torch.zeros(1, device=self.device)``
+    where ``self.device`` is **cuda:0** -- inherited from the checkpoint that
+    was saved on a CUDA box. ``map_location='cpu'`` only remaps storage tensors,
+    not Python ``torch.device`` attributes, so the stale ``cuda:0`` survives
+    and ``torch.zeros(1, device='cuda:0')`` then raises:
+
+        NotImplementedError: Could not run 'aten::empty.memory_format' with
+        arguments from the 'CUDA' backend.
+
+    We instead:
+      1. ``torch.load`` to CPU.
+      2. Reconstruct the Boltz module from the checkpoint's saved
+         ``hyper_parameters`` (filtered to ``Boltz.__init__`` args).
+      3. ``load_state_dict(strict=False)`` for tensors only.
+      4. ``model.eval()`` and return; **the caller** moves to device.
+
+    The freshly-constructed metric instances default to CPU, so the eventual
+    ``model.to('musa:0')`` in the caller probes them with a CPU dummy tensor
+    and the cuda:0 path is never taken.
+    """
+    import inspect
+    from boltzgen.model.models.boltz import Boltz
+
+    print(f"[infer] torch.load (map_location=cpu) ...")
+    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    if "state_dict" not in ckpt:
+        raise SystemExit(
+            f"{checkpoint_path}: not a PL checkpoint (no 'state_dict'). "
+            f"Got top-level keys: {sorted(ckpt.keys())}"
+        )
+
+    hp = dict(ckpt.get("hyper_parameters") or {})
+    # Match what `load_from_checkpoint(use_ema=False, predict_args=...)` would do.
+    hp["use_ema"] = False
+    hp["predict_args"] = predict_args
+
+    # Filter to the kwargs Boltz.__init__ actually accepts; PL stores extras
+    # (like _instantiator) in hyper_parameters that would crash __init__.
+    sig = inspect.signature(Boltz.__init__)
+    allowed = {
+        p.name for p in sig.parameters.values()
+        if p.name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+    }
+    accepts_kwargs = any(
+        p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if accepts_kwargs:
+        hp_clean = hp
+    else:
+        dropped = sorted(set(hp) - allowed)
+        if dropped:
+            print(f"[infer] dropping {len(dropped)} ckpt hparam(s) not in Boltz.__init__: "
+                  f"{dropped}")
+        hp_clean = {k: v for k, v in hp.items() if k in allowed}
+
+    print(f"[infer] constructing Boltz on CPU with {len(hp_clean)} hparams ...")
+    model = Boltz(**hp_clean)
+
+    missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
+    if missing:
+        print(f"[infer] state_dict missing keys: {len(missing)} "
+              f"(first 3: {missing[:3]})")
+    if unexpected:
+        print(f"[infer] state_dict unexpected keys: {len(unexpected)} "
+              f"(first 3: {unexpected[:3]})")
+
+    # `torchmetrics.Metric._load_from_state_dict` re-sets each metric's
+    # ``_device`` from the saved tensor metadata. The checkpoint was created on
+    # a CUDA host, so every MeanMetric inside the model now thinks its device
+    # is ``cuda:0`` even though we mapped storage to CPU. The next
+    # ``model.to('musa:0')`` then walks into ``Metric._apply`` which does
+    #     _dummy_tensor = fn(torch.zeros(1, device=self.device))
+    # and ``torch.zeros(1, device='cuda:0')`` raises:
+    #     NotImplementedError: aten::empty.memory_format ... CUDA backend
+    # because there is no CUDA backend on a MUSA-only host. Forcing every
+    # Metric back to CPU before the move makes the dummy-probe go through CPU
+    # (where the kernel exists), and the subsequent fn() correctly retargets to
+    # MUSA. On CUDA this is a no-op (cpu -> fn -> cuda is the same code path
+    # PL would take internally).
+    n_reset = _reset_torchmetrics_devices_to_cpu(model)
+    if n_reset:
+        print(f"[infer] reset _device to 'cpu' on {n_reset} torchmetrics.Metric "
+              "instance(s) (stale cuda:0 inherited from CUDA-saved checkpoint)")
+
+    model.eval()
+    return model
+
+
+def _reset_torchmetrics_devices_to_cpu(model) -> int:
+    """Force ``Metric._device = torch.device('cpu')`` on every Metric in ``model``.
+
+    Returns the number of Metric instances mutated. Quietly returns 0 if
+    torchmetrics isn't importable (defensive; the file imports it via Boltz
+    in practice)."""
+    try:
+        from torchmetrics import Metric  # type: ignore[import-not-found]
+    except Exception:
+        return 0
+    cpu = torch.device("cpu")
+    n = 0
+    for m in model.modules():
+        if isinstance(m, Metric):
+            m._device = cpu
+            n += 1
+    return n
+
+
 def to_cpu_fp32(x: Any) -> Any:
     """Recursively move tensors to CPU fp32 so the dump is dtype/device free."""
     if torch.is_tensor(x):
@@ -287,24 +402,20 @@ def main() -> int:
     batch = next(iter(loader))
     batch = move_batch_to_device(batch, device)
 
-    # Load model. `predict_args` populates the model's expected dict so the
-    # internal `predict_step` would work too, but we call `forward()` directly
-    # here so we get the raw output dict instead of a writer-formatted file.
+    # Load model on CPU then move ourselves. We deliberately bypass
+    # `Boltz.load_from_checkpoint` here -- on MUSA-only hosts its trailing
+    # `model.to(device)` triggers a torchmetrics CUDA-device probe and dies.
+    # See load_boltz_no_pl_to_device's docstring for the full story.
     print("[infer] loading model from checkpoint ...")
-    from boltzgen.model.models.boltz import Boltz
-    model = Boltz.load_from_checkpoint(
-        str(args.checkpoint),
-        strict=False,
-        use_ema=False,
-        map_location="cpu",
-        weights_only=False,
+    model = load_boltz_no_pl_to_device(
+        args.checkpoint,
         predict_args={
             "recycling_steps": args.recycling_steps,
             "sampling_steps": args.sampling_steps,
             "diffusion_samples": args.diffusion_samples,
         },
     )
-    model.eval()
+    print(f"[infer] moving model to {device} ...")
     model.to(device)
 
     # Re-seed AFTER model load + .to(device): some buffers are initialised

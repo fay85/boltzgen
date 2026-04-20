@@ -127,10 +127,7 @@ class AttentionPairBias(nn.Module):
             # footprint and an OOM hazard. So on MUSA we run SDPA in bf16;
             # on CUDA we keep the original fp32 path the upstream model authors
             # picked (cuDNN's SDPA accepts fp32 natively).
-            if q.is_musa:
-                sdpa_dtype = torch.bfloat16
-            else:
-                sdpa_dtype = torch.float32
+            sdpa_dtype = torch.float32
             o = torch.nn.functional.scaled_dot_product_attention(
                 q.to(sdpa_dtype),
                 k.to(sdpa_dtype),
